@@ -15,6 +15,7 @@ from shapely.geometry import Point, LineString, Polygon, MultiPolygon
 from shapely.ops import transform, unary_union
 from typing import Dict, List, Tuple, Any
 from dataclasses import dataclass
+from tqdm import tqdm
 
 MERIT_RES = 0.000833333  # 3 arc second resolution in degrees
 
@@ -112,8 +113,6 @@ def get_megabasin_outlet_dict(
     Returns:
         Dict mapping {megabasin_id: {outlet_id: [gauge_ids]}}
     """
-    print("Identifying basins for gauges...")
-
     megabasins = gpd.read_file(megabasins_path)
     gauges_with_basins = gpd.sjoin(
         gauges_gdf, megabasins, how="left", predicate="within"
@@ -220,7 +219,6 @@ def build_graph_with_geometries(
         if nextdown and nextdown in G.nodes:
             G.add_edge(node_id, nextdown)
 
-    print(f"Built graph with {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
     return G
 
 
@@ -398,6 +396,8 @@ def insert_all_gauges(
                 "remainder_polygon": remainder_polygon,
             }
 
+    print(f"  Inserted {len(gauge_info)} gauges")
+
     return gauge_info
 
 
@@ -430,7 +430,7 @@ def consolidate_graph(
         if source_data.get("polygon") and target_data.get("polygon"):
             merged_polygon = unary_union(
                 [source_data["polygon"], target_data["polygon"]]
-            )
+            ).buffer(MERIT_RES).buffer(-MERIT_RES) # Closure op. to fill holes.
             if isinstance(merged_polygon, MultiPolygon):
                 merged_polygon = max(merged_polygon.geoms, key=lambda p: p.area)
             target_data["polygon"] = merged_polygon
@@ -605,7 +605,7 @@ def delineate_watershed(
         Dictionary mapping outlet_id to DelineationResult
     """
     print("\n" + "=" * 80)
-    print("SIMPLIFIED WATERSHED DELINEATION")
+    print("GRAPH-BASED WATERSHED DELINEATION")
     print("=" * 80)
 
     all_gauges = load_gauges(gauges_csv)
@@ -615,7 +615,7 @@ def delineate_watershed(
 
     for megabasin_id, outlet_dict in megabasins_outlets.items():
         print(f"\n{'=' * 60}")
-        print(f"Processing Basin {megabasin_id}")
+        print(f"Processing Basin {megabasin_id} (contains {len(outlet_dict)} outlets)")
         print(f"{'=' * 60}")
 
         # Load basin data
@@ -623,7 +623,7 @@ def delineate_watershed(
 
         # Process each outlet in this basin
         for outlet_id, outlet_gauge_ids in outlet_dict.items():
-            print(f"\nProcessing outlet {outlet_id} ({len(outlet_gauge_ids)} gauges)")
+            print(f"Processing outlet {outlet_id} ({len(outlet_gauge_ids)} gauges)")
 
             gauges = all_gauges[all_gauges["id"].isin(outlet_gauge_ids)]
 
@@ -640,8 +640,6 @@ def delineate_watershed(
                 G, gauges, merit_dirs["flow_dir"], megabasin_id
             )
 
-            print(f"  Inserted {len(gauge_info)} gauges successfully")
-
             # Trim network at outlet if it's a gauge
             if outlet_id in G.nodes:
                 trim_at_outlet(G, outlet_id)
@@ -651,10 +649,12 @@ def delineate_watershed(
                 merge_history = consolidate_graph(
                     G, max_area=max_area, preserve_gauges=preserve_gauges
                 )
-                print(f"  Consolidation: {len(merge_history)} merges")
+                # print(f"  Consolidation: {len(merge_history)} merges")
 
             # Store result
             results[outlet_id] = DelineationResult(graph=G, outlet_id=outlet_id)
+
+            print('')
 
     print(f"\n{'=' * 80}")
     print(f"COMPLETE: Processed {len(results)} watersheds")
@@ -672,7 +672,7 @@ def trim_at_outlet(G: nx.DiGraph, outlet_id: str):
     downstream = list(nx.descendants(G, outlet_id))
 
     if downstream:
-        print(f"  Trimming {len(downstream)} nodes downstream of outlet")
+        # Trim any nodes downstream of the lowest gauge.
         for node in downstream:
             G.remove_node(node)
 
@@ -701,11 +701,9 @@ def load_basin_data(
         / f"riv_pfaf_{basin_str}_MERIT_Hydro_v07_Basins_v01.shp"
     )
 
-    print(f"  Loading data from {basin_subdir}")
-    catchments = gpd.read_file(cat_file).set_index("COMID")
-    rivers = gpd.read_file(riv_file).set_index("COMID")
+    catchments = gpd.read_file(cat_file).set_index("COMID").set_crs('EPSG:4326')
+    rivers = gpd.read_file(riv_file).set_index("COMID").set_crs('EPSG:4326')
 
-    print(f"    Loaded {len(catchments)} catchments, {len(rivers)} rivers")
     return catchments, rivers
 
 
