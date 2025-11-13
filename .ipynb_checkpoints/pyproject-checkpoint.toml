@@ -1,0 +1,17 @@
+[project]
+name = "graph-delineator"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "geopandas>=1.1.1",
+    "ipykernel>=7.1.0",
+    "matplotlib>=3.10.7",
+    "networkx>=3.5",
+    "numpy>=2.3.4",
+    "pandas>=2.3.3",
+    "pysheds>=0.5",
+    "shapely>=2.1.2",
+    "tqdm>=4.67.1",
+]
