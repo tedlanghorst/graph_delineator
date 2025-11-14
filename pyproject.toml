@@ -11,6 +11,7 @@ dependencies = [
     "networkx>=3.5",
     "numpy>=2.3.4",
     "pandas>=2.3.3",
+    "pyarrow>=22.0.0",
     "pysheds>=0.5",
     "shapely>=2.1.2",
     "tqdm>=4.67.1",
