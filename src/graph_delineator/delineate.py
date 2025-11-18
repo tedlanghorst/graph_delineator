@@ -6,6 +6,8 @@ Store all data in the graph to avoid synchronization issues.
 Each node contains its polygon, river geometry, and all attributes.
 """
 
+import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
 import networkx as nx
 import geopandas as gpd
 import pandas as pd
@@ -15,7 +17,7 @@ from shapely.geometry import Point, LineString, Polygon, MultiPolygon
 from shapely.ops import transform, unary_union
 from typing import Dict, List, Tuple, Any
 from dataclasses import dataclass
-from tqdm import tqdm
+
 
 MERIT_RES = 0.000833333  # 3 arc second resolution in degrees
 TINY_AREA_THRESHOLD_KM2 = 0.5 
@@ -101,26 +103,20 @@ def load_gauges(csv_file: str, crs: str = "EPSG:4326") -> gpd.GeoDataFrame:
     return gdf
 
 
-def get_megabasin_outlet_dict(
-    gauges_gdf: gpd.GeoDataFrame, megabasins_path: Path
-) -> dict[int, dict[str, list[str]]]:
+def get_pfaf1_outlet_dict(gauges_gdf: gpd.GeoDataFrame) -> dict[int, dict[str, list[str]]]:
     """
     Identify which Pfafstetter basins contain the gauges.
 
     Args:
         gauges_gdf: GeoDataFrame with gauge points (must have 'id' column)
-        megabasins_path: Path to megabasins shapefile
 
     Returns:
         Dict mapping {megabasin_id: {outlet_id: [gauge_ids]}}
     """
-    megabasins = gpd.read_file(megabasins_path)
-    gauges_with_basins = gpd.sjoin(
-        gauges_gdf, megabasins, how="left", predicate="within"
-    )
+    gauges_gdf['pfaf1'] = (gauges_gdf['COMID']//1E7).astype(int)
 
     megabasin_dict = {}
-    for megabasin, group in gauges_with_basins.groupby("BASIN")[["outlet_id", "id"]]:
+    for megabasin, group in gauges_gdf.groupby("pfaf1")[["outlet_id", "id"]]:
         megabasin_dict[megabasin] = (
             group.groupby("outlet_id")["id"].apply(list).to_dict()
         )
@@ -128,41 +124,24 @@ def get_megabasin_outlet_dict(
     return megabasin_dict
 
 
-def get_outlet_comids(
-    gauges: gpd.GeoDataFrame, catchments: gpd.GeoDataFrame, rivers: gpd.GeoDataFrame
-) -> set:
+def get_network_comids(
+    outlet_comid: int, rivers: gpd.GeoDataFrame) -> set:
     """
-    Find all COMIDs in the watershed network containing these gauges.
+    Find all COMIDs in the watershed network containing this outlet.
 
-    Uses network traversal to find all upstream catchments from the outlet.
+    Uses recursive network traversal to find all upstream catchments from the outlet.
     """
-    joined = gpd.sjoin(gauges, catchments.reset_index(), how="left", predicate="within")
-    gauge_comids = set(joined["COMID"].dropna().unique())
 
-    if not gauge_comids:
-        return set()
+    def addnode(B: list, node_id):
+        """Recursively assemble list of upstream unit catchments."""
+        B.append(node_id)
+        for up_field in ["up1", "up2", "up3", "up4"]:
+            up = rivers[up_field].loc[node_id]
+            if up != 0:
+                addnode(B, up)
 
-    # Build network graph
-    G = nx.DiGraph()
-    for comid in rivers.index:
-        nextdown = rivers.loc[comid, "NextDownID"]
-        if nextdown != "0" and nextdown in rivers.index:
-            G.add_edge(comid, nextdown)
-
-    # Find all upstream catchments
-    network_comids = set()
-    for start_comid in gauge_comids:
-        if start_comid in G:
-            # Add all ancestors (upstream)
-            ancestors = {int(a) for a in nx.ancestors(G, start_comid)}
-            network_comids.update(ancestors)
-
-            # Add all descendants (downstream)
-            descendants = {int(d) for d in nx.descendants(G, start_comid)}
-            network_comids.update(descendants)
-
-            # Add the node itself
-            network_comids.add(int(start_comid))
+    network_comids = []
+    addnode(network_comids, outlet_comid)
 
     return network_comids
 
@@ -320,9 +299,78 @@ def insert_gauge_into_graph(
 
     return True
 
+def add_leaf_gauge_to_graph(
+    G: nx.DiGraph,
+    gauge_id: str,
+    lat: float,
+    lng: float,
+    split_polygon: Polygon,
+    remainder_polygon: Polygon,
+    original_node_id: str,
+) -> bool:
+    """
+    Inserts a new gauge as a LEAF node (tributary) flowing into an existing node.
+
+    - The new gauge node [gauge_id] gets the 'split_polygon' and its area.
+    - The [original_node_id] keeps the 'remainder_polygon' and its reduced area.
+    - Flow from other predecessors into [original_node_id] is NOT interrupted.
+    - A new edge [gauge_id] -> [original_node_id] is created.
+    """
+    if original_node_id not in G.nodes:
+        print(f"Warning: Node {original_node_id} not in graph")
+        return False
+
+    if gauge_id in G.nodes:
+        print(f"Error: Node {gauge_id} already exists in graph")
+        return False
+
+    original_data = G.nodes[original_node_id]
+
+    # Calculate areas
+    transformer = pyproj.Transformer.from_crs("EPSG:4326", "ESRI:54009", always_xy=True)
+    gauge_area = transform(transformer.transform, split_polygon).area / 1e6
+    remainder_area = transform(transformer.transform, remainder_polygon).area / 1e6
+
+    # --- No river geometry or length splitting is performed ---
+    # The new gauge is a separate tributary, so it doesn't split the
+    # original node's river segment. We assume its river geometry
+    # and length are not derived from the original node.
+    leaf_river_geom = None  # Or could be passed as an argument if available
+    leaf_length_km = 0.0  # Or passed as an argument
+
+    # Create the new gauge (leaf) node
+    G.add_node(
+        gauge_id,
+        polygon=split_polygon,
+        river_geom=leaf_river_geom,
+        area_km2=gauge_area,
+        length_km=leaf_length_km,
+        node_type="leaf_gauge",
+        is_gauge=True,
+        lat=lat,
+        lng=lng,
+        original_comid=original_data.get("original_comid"),
+    )
+
+    # Update original node with the remainder polygon and area
+    # We DO NOT modify its river_geom or length_km.
+    G.nodes[original_node_id].update(
+        {
+            "polygon": remainder_polygon,
+            "area_km2": remainder_area,
+            "node_type": "tributary_junction",  # Mark as modified
+        }
+    )
+
+    # Rewire edges: Add the new leaf as a predecessor
+    # We DO NOT touch existing predecessors.
+    G.add_edge(gauge_id, original_node_id)
+
+    return True
+
 
 def insert_all_gauges(
-    G: nx.DiGraph, gauges_gdf: gpd.GeoDataFrame, flow_dir_path: Path, basin_id: int
+    G: nx.DiGraph, gauges: gpd.GeoDataFrame, flow_dir_path: Path, flow_acc_path: Path, pfaf2_id: int
 ) -> Dict[str, Any]:
     """
     Insert all gauges into the graph.
@@ -332,100 +380,81 @@ def insert_all_gauges(
     from .split_catchment import split_catchment_raster
 
     gauge_info = {}
-
-    # Project to equal area for area calculations
-    transformer = pyproj.Transformer.from_crs("EPSG:4326", "ESRI:54009", always_xy=True)
+    # Track node replacements: old_node_id -> new_gauge_id
+    node_replacements = {}
     
-    # Define a threshold for a "sliver" polygon (e.g., 0.5 km^2)
-    
+    # COMID is what we assigned during matchups. 
+    # node_id links this gauge into the graph and will change as we split and merge polys. 
+    gauges['node_id'] = gauges['COMID'].astype(str)
 
-    # Find which catchment each gauge falls in
-    catchment_polys = []
-    node_ids = []
-    for node_id, data in G.nodes(data=True):
-        if data.get("polygon"):
-            catchment_polys.append(data["polygon"])
-            node_ids.append(node_id)
+    # Process from upstream (0.0) to downstream (1.0)
+    gauges = gauges.sort_values(['node_id', 'position'])
 
-    catchments_gdf = gpd.GeoDataFrame(
-        {"node_id": node_ids}, geometry=catchment_polys, crs=gauges_gdf.crs
-    )
+    for _, gauge in gauges.iterrows():
+        gauge_id = str(gauge["id"])
 
-    # Spatial join
-    gauges_with_nodes = gpd.sjoin(
-        gauges_gdf, catchments_gdf, how="left", predicate="within"
-    )
+        # Follow the replacement chain to find current node
+        original_node_id = gauge["node_id"]
+        current_node_id = original_node_id
+        while current_node_id in node_replacements:
+            current_node_id = node_replacements[current_node_id]
 
-    for _, gauge in gauges_with_nodes.iterrows():
-        if pd.isna(gauge.get("node_id")):
-            print(f"  Warning: Gauge {gauge['id']} not in any catchment")
-            continue
+        # Get the current polygon (may have been split already)
+        current_polygon = G.nodes[current_node_id]["polygon"]
 
-        node_id = gauge["node_id"]
-        gauge_id = gauge["id"]
-
-        if node_id not in G.nodes:
-            # Node might have been replaced by a previous gauge
-            continue 
-
-        original_polygon = G.nodes[node_id]["polygon"]
-
-        # Split using raster method
-        gauge_polygon = split_catchment_raster(
-            gauge_id=gauge_id,
-            basin=basin_id,
-            lat=gauge["lat"],
-            lng=gauge["lng"],
-            catchment_poly=original_polygon,
+        gauge_polygon, is_leaf = split_catchment_raster(
+            gauge=gauge.to_dict(),
+            basin=pfaf2_id,
+            catchment_poly=current_polygon,
             flow_dir_path=flow_dir_path,
+            flow_acc_path=flow_acc_path,
         )
 
-        # If pysheds fails, just replace the node
+        is_leaf = False
+
+        
         if gauge_polygon is None:
-            print(f"  WARNING: Could not split catchment for gauge {gauge_id}. Replacing node.")
-            convert_node_to_gauge(G, gauge_id, gauge["lat"], gauge["lng"], node_id)
-            gauge_info[gauge_id] = {"original_node": node_id, "method": "replace_fallback"}
+            # Failed, reason will be logged by fn
             continue
 
-        # Calculate areas in km^2
-        gauge_poly_area = transform(transformer.transform, gauge_polygon).area / 1e6
-        original_poly_area = transform(transformer.transform, original_polygon).area / 1e6
+        if gauge_polygon == current_polygon:
+            # No split needed. Convert the node to a gauge
+            convert_node_to_gauge(G, gauge_id, gauge["lat"], gauge["lng"], current_node_id)
+            # Track that this node was replaced
+            node_replacements[current_node_id] = gauge_id
+            gauge_info[gauge_id] = {
+                "original_node": original_node_id, 
+                "current_node": current_node_id, 
+                "method": "replace",
+            }
+            continue
 
-        remainder_polygon = original_polygon.difference(gauge_polygon)
-        if remainder_polygon is None:
-            remainder_poly_area = 0.0 
+        # Calculate remainder
+        remainder_polygon = current_polygon.difference(gauge_polygon)
+        remainder_polygon = remainder_polygon.buffer(-MERIT_RES / 2).buffer(MERIT_RES / 2)
+
+        if is_leaf:
+            add_leaf_gauge_to_graph(
+                G,
+                gauge_id,
+                gauge['lat'],
+                gauge['lng'],
+                gauge_polygon,
+                remainder_polygon,
+                current_node_id
+            )
         else:
-            remainder_polygon = remainder_polygon.buffer(-MERIT_RES / 2).buffer(MERIT_RES / 2)
-            if isinstance(remainder_polygon, MultiPolygon):
-                remainder_polygon = max(remainder_polygon.geoms, key=lambda p: p.area)
-            remainder_poly_area = transform(transformer.transform, remainder_polygon).area / 1e6
-        
-        
-        # Check if either resulting piece is a "sliver"
-        # We also check a relative threshold (e.g., 1% of original area)
-        relative_threshold = original_poly_area * 0.01
-        threshold = max(TINY_AREA_THRESHOLD_KM2, relative_threshold)
-
-        if gauge_poly_area < threshold or remainder_poly_area < threshold:
-            # Case 1: Gauge is at/near an edge. Don't split, just replace.
-            convert_node_to_gauge(G, gauge_id, gauge["lat"], gauge["lng"], node_id)
-            gauge_info[gauge_id] = {"original_node": node_id, "method": "convert_boundary"}
-
-        else:
-            # Case 2: Split is valid. Proceed with original split logic.
-            success = insert_gauge_into_graph(
+            insert_gauge_into_graph(
                 G,
                 gauge_id,
                 gauge["lat"],
                 gauge["lng"],
                 gauge_polygon,
                 remainder_polygon,
-                node_id,
+                current_node_id,
             )
-            if success:
-                gauge_info[gauge_id] = {"original_node": node_id, "method": "split"}
+            gauge_info[gauge_id] = {"original_node": original_node_id, "current_node": current_node_id, "method": "split"}
 
-    print(f"  Inserted {len(gauge_info)} gauges")
     return gauge_info
 
 def convert_node_to_gauge(
@@ -458,16 +487,18 @@ def convert_node_to_gauge(
 # =============================================================================
 def consolidate_graph(
     G: nx.DiGraph,
-    max_area: float = 500,
+    target_area: float = 500,
     preserve_gauges: bool = True,
     max_iterations: int = 100
 ) -> List[Dict[str, Any]]:
     """
     Consolidate river network (DiGraph) by merging small catchments into neighbors
-    while preserving gauge downstream boundaries.
+    while targeting a specific catchment area.
 
     Rules:
-      • Small nodes (< max_area) can merge into upstream or downstream neighbors.
+      • Small nodes (< target_area) merge ONLY downstream (upward in the network).
+      • All upstream siblings must be able to merge together into their common downstream node.
+      • Prioritizes merges that get closest to target_area without exceeding it.
       • Gauge nodes can receive merges (upstream → gauge allowed).
       • Gauge nodes cannot be merged into another node.
       • Merging respects flow direction and rewires edges safely.
@@ -492,9 +523,6 @@ def consolidate_graph(
         if s.get("polygon") is not None and t.get("polygon") is not None:
             merged_polygon = unary_union([s["polygon"], t["polygon"]]) \
                                 .buffer(MERIT_RES).buffer(-MERIT_RES)
-            # if isinstance(merged_polygon, MultiPolygon):
-            #     merged_polygon = merged_polygon.convex_hull
-                # merged_polygon = max(merged_polygon.geoms, key=lambda p: p.area)
             t["polygon"] = merged_polygon
 
         # --- Merge area + length ---
@@ -525,71 +553,67 @@ def consolidate_graph(
             "reason": reason,
         }
 
-    # ----- Main iterative merging loop -----
-
-    for iteration in range(max_iterations):
-        merges_this_round = []
-
-        # candidates = small, non-gauge nodes
-        merge_candidates = [
-            n for n in list(G.nodes)
-            if can_be_source(n)
-            and G.nodes[n].get("area_km2", 0) < max_area
-        ]
-
-        if not merge_candidates:
-            break
-
-        for n in merge_candidates:
-            if n not in G:
+    for _ in range(max_iterations):
+        # Group nodes by their downstream neighbor
+        downstream_groups = {}
+        
+        for n in list(G.nodes):
+            if not can_be_source(n):
                 continue
-
+            
             area_n = G.nodes[n].get("area_km2", 0)
-
-            # ----- Try downstream merge first -----
-            succs = list(G.successors(n))
-            for s in succs:
-
-                combined_area = area_n + G.nodes[s].get("area_km2", 0)
-                if combined_area <= max_area:
-                    info = merge_nodes(n, s, "upstream_to_downstream")
-                    if info:
-                        merges_this_round.append(info)
-                        break  # source removed, stop
-
-            if n not in G:
+            if area_n >= target_area:
                 continue
-
-            # ----- Try upstream merge (n → predecessor) -----
-            preds = list(G.predecessors(n))
-            for p in preds:
-
-                if preserve_gauges and G.nodes[p].get("is_gauge", False):
-                    # Do not merge a downstream node (n) INTO an upstream gauge (p)
-                    continue
-
-                combined_area = area_n + G.nodes[p].get("area_km2", 0)
-                if combined_area <= max_area:
-                    info = merge_nodes(n, p, "downstream_to_upstream")
-                    if info:
-                        merges_this_round.append(info)
-                        break
-
-        if not merges_this_round:
+            
+            succs = list(G.successors(n))
+            if len(succs) == 1:  # Node has exactly one downstream neighbor
+                downstream = succs[0]
+                if downstream not in downstream_groups:
+                    downstream_groups[downstream] = []
+                downstream_groups[downstream].append(n)
+        
+        if not downstream_groups:
             break
-
+        
+        # Find the best merge: the one that gets closest to target_area without exceeding
+        best_merge = None
+        best_distance = float('inf')
+        
+        for downstream, upstream_nodes in downstream_groups.items():
+            # Check if ALL upstream nodes + downstream node fit within target_area
+            total_area = G.nodes[downstream].get("area_km2", 0)
+            total_area += sum(G.nodes[n].get("area_km2", 0) for n in upstream_nodes)
+            
+            if total_area <= target_area:
+                # Calculate how close this gets us to the target
+                distance = target_area - total_area
+                
+                if distance < best_distance:
+                    best_distance = distance
+                    best_merge = (downstream, upstream_nodes, total_area)
+        
+        if best_merge is None:
+            break
+        
+        # Perform the best merge
+        downstream, upstream_nodes, total_area = best_merge
+        merges_this_round = []
+        
+        for upstream in upstream_nodes:
+            info = merge_nodes(upstream, downstream, "upstream_group_to_downstream")
+            if info:
+                merges_this_round.append(info)
+        
         merge_history.extend(merges_this_round)
 
-        # Recompute stream order after structural change
-        calculate_stream_orders(G)
+
+    # Recompute stream order after structural change
+    calculate_stream_orders(G)
 
     # Recompute upstream accumulated areas
     calculate_upstream_areas(G)
 
-    print(f"  Completed {len(merge_history)} merges in {iteration+1} iterations")
-
     return merge_history
-
 
 
 def calculate_stream_orders(G: nx.DiGraph):
@@ -654,12 +678,13 @@ def calculate_upstream_areas(G: nx.DiGraph):
 
 
 def delineate_watershed(
-    gauges_csv: str,
+    gauges_path: str,
     merit_dirs: Dict[str, Path],
-    output_dir: Path,
     max_area: float = 500,
     consolidate: bool = True,
     preserve_gauges: bool = True,
+    output_dir: Path = None,
+    save_plots: bool = False,
 ) -> Dict[str, DelineationResult]:
     """
     Main function to delineate watersheds.
@@ -674,38 +699,52 @@ def delineate_watershed(
     Returns:
         Dictionary mapping outlet_id to DelineationResult
     """
+    gauges_path = Path(gauges_path)
+    if output_dir is None:
+        output_dir = (gauges_path.parent / gauges_path.stem).resolve()
+
     print("\n" + "=" * 80)
     print("GRAPH-BASED WATERSHED DELINEATION")
+    print(f"Data output directory: {output_dir}")
     print("=" * 80)
 
-    all_gauges = load_gauges(gauges_csv)
-    megabasins_outlets = get_megabasin_outlet_dict(all_gauges, merit_dirs["megabasins"])
+    
+    all_gauges = load_gauges(gauges_path)
+    pfaf1_outlets = get_pfaf1_outlet_dict(all_gauges)
 
-    for megabasin_id, outlet_dict in megabasins_outlets.items():
+    for pfaf1_id, outlet_dict in pfaf1_outlets.items():
         print(f"\n{'=' * 60}")
-        print(f"Processing Basin {megabasin_id} (contains {len(outlet_dict)} outlets)")
+        print(f"Processing Pfafstetter Basin {pfaf1_id} (contains {len(outlet_dict)} outlets)")
         print(f"{'=' * 60}")
 
         # Load basin data
-        mega_catchments, mega_rivers = load_basin_data(megabasin_id, merit_dirs)
+        pfaf1_catchments, pfaf1_rivers = load_basin_data(pfaf1_id, merit_dirs)
 
         # Process each outlet in this basin
         for outlet_id, outlet_gauge_ids in outlet_dict.items():
+
+            # # TESTING
+            # if len(outlet_gauge_ids) < 5 or len(outlet_gauge_ids) > 30:
+            #     continue
+
             print(f"Processing outlet {outlet_id} ({len(outlet_gauge_ids)} gauges)")
 
             gauges = all_gauges[all_gauges["id"].isin(outlet_gauge_ids)]
+            gauges = set_gauge_area_range(gauges, pfaf1_rivers)
 
-            comids = get_outlet_comids(gauges, mega_catchments, mega_rivers)
+            final_comid = gauges[gauges['id'] == outlet_id]['COMID'].item()
+            comids = get_network_comids(final_comid,  pfaf1_rivers)
 
-            catchments = mega_catchments.loc[mega_catchments.index.isin(comids)]
-            rivers = mega_rivers.loc[mega_rivers.index.isin(comids)]
+            catchments = pfaf1_catchments.loc[pfaf1_catchments.index.isin(comids)]
+            rivers = pfaf1_rivers.loc[pfaf1_rivers.index.isin(comids)]
 
             # Build graph with all geometries
             G = build_graph_with_geometries(catchments, rivers)
 
             # Insert gauges
+            pfaf2_id = int(final_comid // 1E6)
             gauge_info = insert_all_gauges(
-                G, gauges, merit_dirs["flow_dir"], megabasin_id
+                G, gauges, merit_dirs["flow_dir"], merit_dirs["flow_acc"], pfaf2_id
             )
 
             # Trim network at outlet if it's a gauge
@@ -714,20 +753,34 @@ def delineate_watershed(
 
             # Consolidate if requested
             if consolidate:
+                # starting_nodes = len(G.nodes)
                 merge_history = consolidate_graph(
                     G, max_area=max_area, preserve_gauges=preserve_gauges
                 )
-                # print(f"  Consolidation: {len(merge_history)} merges")
+                # ending_nodes = len(G.nodes)
+                # print(f"  Consolidated graph from {starting_nodes} to {ending_nodes} nodes")
 
             # Store result
             result = DelineationResult(graph=G, outlet_id=outlet_id)
-            save_result(outlet_id, result, output_dir)
+            save_result(outlet_id, result, output_dir, save_plots)
 
-            print('')
 
     print(f"\n{'=' * 80}")
     print("COMPLETE")
     print(f"{'=' * 80}")
+
+
+def set_gauge_area_range(gauges, rivers):
+    gauges = gauges.copy()
+    gauges['min_area_km2'] = 0.0
+    gauges['max_area_km2'] = 0.0
+
+    for i, g in gauges.iterrows():
+        min_area = rivers.loc[rivers['NextDownID'] == g['COMID'], 'uparea'].sum()
+        gauges.loc[i, 'min_area_km2'] = min_area
+        gauges.loc[i, 'max_area_km2'] = rivers.loc[g['COMID'], 'uparea']
+    
+    return gauges
 
 
 
@@ -752,21 +805,13 @@ def load_basin_data(
     basin_id: int, merit_dirs: Dict[str, Path]
 ) -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
     """Load MERIT catchment and river data for a basin"""
-    catchment_dir = Path(merit_dirs["catchment"])
-    river_dir = Path(merit_dirs["river"])
-
-    basin_str = f"{basin_id:02d}"
-    basin_subdir = f"pfaf_{basin_str}_MERIT_Hydro_v07_Basins_v01"
+    basins_dir = Path(merit_dirs["basins"])
 
     cat_file = (
-        catchment_dir
-        / basin_subdir
-        / f"cat_pfaf_{basin_str}_MERIT_Hydro_v07_Basins_v01.shp"
+        basins_dir / f"cat_pfaf_{int(basin_id)}_MERIT_Hydro_v07_Basins_v01_bugfix1.shp"
     )
     riv_file = (
-        river_dir
-        / basin_subdir
-        / f"riv_pfaf_{basin_str}_MERIT_Hydro_v07_Basins_v01.shp"
+        basins_dir / f"riv_pfaf_{int(basin_id)}_MERIT_Hydro_v07_Basins_v01_bugfix1.shp"
     )
 
     catchments = gpd.read_file(cat_file).set_index("COMID").set_crs('EPSG:4326')
@@ -775,18 +820,47 @@ def load_basin_data(
     return catchments, rivers
 
 
-def save_result(outlet_id: str, result: DelineationResult, output_dir: Path):
+def save_result(outlet_id: str, result: DelineationResult, output_dir: Path, save_plots: bool):
     """Save all watershed results"""
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     # Export to GeoDataFrames
     subbasins, gauges = result.to_geodataframes()
 
     if not subbasins.empty:
-        subbasins.to_parquet(output_dir / f"{outlet_id}_subbasins.parquet")
+        subbasins_dir = output_dir / 'subbasins'
+        subbasins_dir.mkdir(parents=True, exist_ok=True)
+        # subbasins.to_file(subbasins_dir / f"{outlet_id}.gpkg", driver='GPKG')
+        subbasins.to_parquet(subbasins_dir / f"{outlet_id}_subbasins.parquet")
     if not gauges.empty:
-        gauges.to_parquet(output_dir / f"{outlet_id}_gauges.parquet")
+        gauges_dir = output_dir / 'gauges'
+        gauges_dir.mkdir(parents=True, exist_ok=True)
+        # gauges.to_file(gauges_dir / f"{outlet_id}.gpkg", driver='GPKG')
+        gauges.to_parquet(gauges_dir / f"{outlet_id}_gauges.parquet")
 
+    if save_plots and not subbasins.empty and not gauges.empty:
+        ids = pd.concat([
+            subbasins.loc[subbasins['is_gauge'], 'id'],
+            gauges['id']
+        ]).unique()
+
+        cmap = plt.get_cmap('tab20')
+        id_to_color = {id_val: cmap(i % cmap.N) for i, id_val in enumerate(ids)}
+
+        sub_color = subbasins[subbasins['is_gauge']]['id'].map(id_to_color)
+        gauge_color = gauges['id'].map(id_to_color)
+
+        # import numpy as np
+        # subbasins['log_area'] = np.log10(subbasins['uparea_km2'])
+
+        fig, ax = plt.subplots(figsize=(6,6))
+        subbasins.plot(color='grey', ax=ax)
+        subbasins[subbasins['is_gauge']].plot(color=sub_color, ax=ax, edgecolor='black', linewidth=0.5)
+        gauges.plot(color=gauge_color, ax=ax, edgecolor='black', linewidth=0.8)
+
+        plot_dir = output_dir / 'plots'
+        plot_dir.mkdir(parents=True, exist_ok=True)
+        fig.savefig(plot_dir / f"{outlet_id}.png", dpi=300)
+        plt.close(fig)
 
 # # =============================================================================
 # # MAIN ENTRY POINT
@@ -795,11 +869,9 @@ def save_result(outlet_id: str, result: DelineationResult, output_dir: Path):
 # if __name__ == "__main__":
 #     # Example usage
 #     merit_dirs = {
-#         "catchment": Path("/path/to/catchments"),
-#         "river": Path("/path/to/rivers"),
+#         "basins": Path("/path/to/catchments_and_centerlines"),
 #         "flow_dir": Path("/path/to/flow_direction"),
 #         "accum": Path("/path/to/accumulation"),
-#         "megabasins": Path("/path/to/megabasins.shp"),
 #     }
 
 #     results = delineate_watershed(
