@@ -2,16 +2,15 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-import scipy.ndimage as ndi
 from numpy import ceil, floor
 from shapely.geometry import Polygon, MultiPolygon
 from shapely.ops import unary_union
 from pyproj import Geod
 
-
 MIN_PIXELS = 5
 MERIT_RES = 0.000833333
 PIXEL_AREA = MERIT_RES * MERIT_RES
+
 
 def _get_largest_polygon(geom):
     """Extract largest polygon from a geometry (handles MultiPolygon)"""
@@ -22,19 +21,16 @@ def _get_largest_polygon(geom):
 
 def get_pixel_area_m2(gauge, grid):
     g = Geod(ellps="WGS84")
-    lon, lat = gauge['lng'], gauge['lat']
-    
+    lon, lat = gauge["lng"], gauge["lat"]
+
     # Four corners of pixel around gauge
     x0, y0 = lon, lat
     x1 = lon + grid.affine[0]
-    y1 = lat + grid.affine[4]   # negative
-    
-    area, _ = g.polygon_area_perimeter(
-        [x0, x1, x1, x0], 
-        [y0, y0, y1, y1]
-    )
+    y1 = lat + grid.affine[4]  # negative
+
+    area, _ = g.polygon_area_perimeter([x0, x1, x1, x0], [y0, y0, y1, y1])
     pixel_area_m2 = abs(area)
-    
+
     return pixel_area_m2
 
 
@@ -96,11 +92,14 @@ def split_catchment_raster(
     dirmap = (64, 128, 1, 2, 4, 8, 16, 32)  # ESRI flow direction standard
 
     # Get the minimum flow (in pixels) of the mainstem of this polygon.
-    min_area_m2 = gauge['min_area_km2'] * 1E6 * 0.9
+    min_area_m2 = gauge["min_area_km2"] * 1e6 * 0.9
     pixel_area_m2 = get_pixel_area_m2(gauge, grid)
     facc_thresh = max(min_area_m2 / pixel_area_m2, 100)
 
-    x_snap, y_snap = grid.snap_to_mask(facc > facc_thresh, (gauge['lng'], gauge['lat']))
+    if facc.max() < facc_thresh:
+        print(f"flow accumulation threshold ({facc_thresh}) was greater than maxmimum flow accumulation in catchment ({facc.max()}) for gauge id {gauge['id']}")
+        return None
+    x_snap, y_snap = grid.snap_to_mask(facc > facc_thresh, (gauge["lng"], gauge["lat"]))
 
     # Delineate watershed using pysheds
     try:
@@ -116,7 +115,7 @@ def split_catchment_raster(
         clipped_catch = grid.view(catch, dtype=np.uint8)
     except Exception as e:
         print(f"Error during catchment delineation for gauge {gauge['id']}: {e}")
-        return None, None
+        return None
 
     # Convert raster to polygon
     shapes = grid.polygonize(clipped_catch)
@@ -136,31 +135,21 @@ def split_catchment_raster(
         result_polygon = shapely_polygons[0]
     else:
         print(f"Warning: No polygon generated for gauge {gauge['id']}")
-        return None, None
-    
+        return None
+
     # By definition, pysheds.catchment finds the area UPSTREAM of the pour point.
     # result_polygon IS the upstream polygon.
     upstream_poly = result_polygon
 
     # The remainder is the downstream portion.
     downstream_poly = catchment_poly.difference(upstream_poly)
-    
-    # Validate the split based on pixel counts.
-    downstream_pixels = downstream_poly.area / PIXEL_AREA
-    
+
     # Check for slivers.
     # Only skip split if DOWNSTREAM portion is tiny (gauge at bottom of catchment).
+    downstream_pixels = downstream_poly.area / PIXEL_AREA
     if downstream_pixels < MIN_PIXELS:
         # Gauge is at the very bottom - it gets the entire catchment.
-        return catchment_poly, False
-    
-    # Check if we are an internal tributary (graph leaf) of the catchment
-    catch_edge = catch & ~ndi.binary_erosion(catch)
-    significant_edge_flow = catch_edge & (facc > (facc_thresh*0.95))
-    # Label the clusters (Connected Components)
-    # structure=np.ones((3,3)) allows diagonal connections (8-connectivity)
-    _, num_features = ndi.label(significant_edge_flow, structure=np.ones((3,3)))
-    is_leaf = num_features > 1
-    
+        return catchment_poly
+
     # Return the delineated upstream polygon.
-    return upstream_poly, is_leaf
+    return upstream_poly
