@@ -16,73 +16,16 @@ from tqdm import tqdm
 from shapely.geometry import Point, LineString, Polygon
 from shapely.ops import transform, unary_union
 from typing import Dict, List, Tuple, Any
-from dataclasses import dataclass
 
+from .split_catchment import split_catchment_raster
+from .dataclasses import DelineationResult
 
 MERIT_RES = 0.000833333  # 3 arc second resolution in degrees
 TINY_AREA_THRESHOLD_KM2 = 0.5
 
 # =============================================================================
-# DATA STRUCTURES
-# =============================================================================
-
-
-@dataclass
-class DelineationResult:
-    """Container for delineation results"""
-
-    graph: nx.DiGraph
-    outlet_id: str
-
-    def to_geodataframes(
-        self, crs="EPSG:4326"
-    ) -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame]:
-        """Export graph to GeoDataFrames for visualization/saving"""
-        subbasins = self._export_subbasins(crs)
-        gauges = self._export_gauges(crs)
-        return subbasins, gauges
-
-    def _export_subbasins(self, crs) -> gpd.GeoDataFrame:
-        records = []
-        for node_id, data in self.graph.nodes(data=True):
-            if data.get("polygon") is not None:
-                records.append(
-                    {
-                        "id": node_id,
-                        "geometry": data["polygon"],
-                        "area_km2": data.get("area_km2", 0),
-                        "uparea_km2": data.get("uparea_km2", 0),
-                        "node_type": data.get("node_type", "unknown"),
-                        "is_gauge": data.get("is_gauge", False),
-                        "nextdown": list(self.graph.successors(node_id))[0]
-                        if self.graph.out_degree(node_id) > 0
-                        else None,
-                    }
-                )
-        return gpd.GeoDataFrame(records, crs=crs) if records else gpd.GeoDataFrame()
-
-    def _export_gauges(self, crs) -> gpd.GeoDataFrame:
-        records = []
-        for node_id, data in self.graph.nodes(data=True):
-            if data.get("is_gauge", False):
-                records.append(
-                    {
-                        "id": node_id,
-                        "geometry": Point(data["lng"], data["lat"]),
-                        "lat": data["lat"],
-                        "lng": data["lng"],
-                        "area_km2": data.get("area_km2", 0),
-                        "uparea_km2": data.get("uparea_km2", 0),
-                    }
-                )
-        return gpd.GeoDataFrame(records, crs=crs) if records else gpd.GeoDataFrame()
-
-
-# =============================================================================
 # GAUGE UTILS
 # =============================================================================
-
-
 def load_gauges(csv_file: str, crs: str = "EPSG:4326") -> gpd.GeoDataFrame:
     """
     Load gauge locations from CSV.
@@ -313,8 +256,6 @@ def insert_all_gauges(
     If a gauge is at the catchment outlet, it replaces the node.
     Otherwise, it splits the node.
     """
-    from .split_catchment import split_catchment_raster
-
     gauge_info = {}
     # Track node replacements: old_node_id -> new_gauge_id
     node_replacements = {}
@@ -587,10 +528,12 @@ def collapse_stems(
     preserve_gauges: bool,
     merge_history: List[Dict[str, Any]],
 ):
-    """Mimics collapse_stems: merges stems downstream (source=stem, target=successor)."""
+    """
+    Mimics collapse_stems: merges stems downstream (source=stem, target=successor).
+    UPDATED: Now includes junction preservation logic.
+    """
 
-    # Stems are nodes with in-degree < 2 (or in-degree == 1, if considering headwaters separately).
-    # The first code also specifically handled junctions, but here we focus on the core stem logic.
+    # Stems are nodes with in-degree < 2 (or in-degree == 1).
     stems = [
         n for n in G.nodes
         if G.in_degree(n) < 2 
@@ -606,15 +549,28 @@ def collapse_stems(
     for source in stems:
         if source not in G.nodes:
             continue
-        target = list(G.successors(source))[0]
+        
+        # Get the downstream neighbor
+        succs = list(G.successors(source))
+        if not succs:
+            continue
+        target = succs[0]
 
-        # Target must be able to receive merges
+        # Target must be present in graph
         if target not in G.nodes:
             continue
+
+        # If the target is a junction (has more than 1 incoming river), 
+        # do NOT merge the current stem into it. This keeps the confluence point fixed.
+        if G.in_degree(target) > 1:
+            continue
+
+        # Check area thresholds
         if (
             G.nodes[source].get("area_km2", 0) + G.nodes[target].get("area_km2", 0)
             < target_area
         ):
+            # Check if target is a gauge or valid source
             if can_be_source(G, target, preserve_gauges) or (
                 preserve_gauges and G.nodes[target].get("is_gauge", False)
             ):
@@ -736,7 +692,7 @@ def calculate_upstream_areas(G: nx.DiGraph):
 # =============================================================================
 
 
-def delineate_watershed(
+def delineate_basins(
     gauges_path: str,
     merit_dirs: Dict[str, Path],
     max_area: float = 500,
@@ -781,7 +737,7 @@ def delineate_watershed(
         pfaf1_catchments, pfaf1_rivers = load_basin_data(pfaf1_id, merit_dirs)
 
         # Process each outlet in this basin
-        for outlet_id, outlet_gauge_ids in tqdm(outlet_dict.items(), desc=f'Basins {pfaf1_id}'):
+        for outlet_id, outlet_gauge_ids in tqdm(outlet_dict.items(), desc=f'Basin {pfaf1_id}'):
             gauges = all_gauges[all_gauges["id"].isin(outlet_gauge_ids)]
             gauges = set_gauge_area_range(gauges, pfaf1_rivers)
 
@@ -917,35 +873,3 @@ def save_result(
         plt.close(fig)
 
 
-# # =============================================================================
-# # MAIN ENTRY POINT
-# # =============================================================================
-
-# if __name__ == "__main__":
-#     # Example usage
-#     merit_dirs = {
-#         "basins": Path("/path/to/catchments_and_centerlines"),
-#         "flow_dir": Path("/path/to/flow_direction"),
-#         "accum": Path("/path/to/accumulation"),
-#     }
-
-#     results = delineate_watershed(
-#         gauges_csv="gauges.csv",
-#         merit_dirs=merit_dirs,
-#         max_area=500,
-#         consolidate=True,
-#         preserve_gauges=True,
-#     )
-
-#     # Save results
-#     save_results(results, "output")
-
-#     # Example: Access specific watershed
-#     if "outlet_001" in results:
-#         result = results["outlet_001"]
-#         print(f"\nOutlet 001: {result.graph.number_of_nodes()} nodes")
-
-#         # Export to GeoDataFrames for visualization
-#         subbasins, gauges = result.to_geodataframes()
-#         print(f"  Subbasins: {len(subbasins)}")
-#         print(f"  Gauges: {len(gauges)}")

@@ -2,22 +2,8 @@ import networkx as nx
 import geopandas as gpd
 from shapely.geometry import Point
 from dataclasses import dataclass
+from typing import Tuple
 
-
-@dataclass
-class GaugeSplit:
-    """Information about how a gauge split a catchment"""
-
-    gauge_id: str
-    original_comid: str
-    snapped_point: Point  # Gauge location (already on river)
-    split_ratio: float  # 0-1, distance along river segment
-    gauge_polygon: object  # Upstream polygon from raster delineation
-    remainder_polygon: object  # Downstream polygon
-    upstream_node: str  # Node upstream of split
-    downstream_node: str  # Node downstream of split
-    lat: float  # Original gauge lat (already snapped)
-    lng: float  # Original gauge lng (already snapped)
 
 
 @dataclass
@@ -25,18 +11,48 @@ class DelineationResult:
     """Container for delineation results"""
 
     graph: nx.DiGraph
-    subbasins: gpd.GeoDataFrame
-    rivers: gpd.GeoDataFrame
-    gauges: gpd.GeoDataFrame
-    gauge_splits: dict[str, GaugeSplit]
-    merge_history: list[dict]  # List of merge operations
+    outlet_id: str
 
-    def __repr__(self):
-        return (
-            f"DelineationResult(\n"
-            f"  nodes={self.graph.number_of_nodes()}, "
-            f"  edges={self.graph.number_of_edges()},\n"
-            f"  gauges={len(self.gauges)}, "
-            f"  subbasins={len(self.subbasins)}\n"
-            f")"
-        )
+    def to_geodataframes(
+        self, crs="EPSG:4326"
+    ) -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame]:
+        """Export graph to GeoDataFrames for visualization/saving"""
+        subbasins = self._export_subbasins(crs)
+        gauges = self._export_gauges(crs)
+        return subbasins, gauges
+
+    def _export_subbasins(self, crs) -> gpd.GeoDataFrame:
+        records = []
+        for node_id, data in self.graph.nodes(data=True):
+            if data.get("polygon") is not None:
+                records.append(
+                    {
+                        "id": node_id,
+                        "geometry": data["polygon"],
+                        "area_km2": data.get("area_km2", 0),
+                        "uparea_km2": data.get("uparea_km2", 0),
+                        "node_type": data.get("node_type", "unknown"),
+                        "is_gauge": data.get("is_gauge", False),
+                        "nextdown": list(self.graph.successors(node_id))[0]
+                        if self.graph.out_degree(node_id) > 0
+                        else None,
+                    }
+                )
+        return gpd.GeoDataFrame(records, crs=crs) if records else gpd.GeoDataFrame()
+
+    def _export_gauges(self, crs) -> gpd.GeoDataFrame:
+        records = []
+        for node_id, data in self.graph.nodes(data=True):
+            if data.get("is_gauge", False):
+                records.append(
+                    {
+                        "id": node_id,
+                        "geometry": Point(data["lng"], data["lat"]),
+                        "lat": data["lat"],
+                        "lng": data["lng"],
+                        "area_km2": data.get("area_km2", 0),
+                        "uparea_km2": data.get("uparea_km2", 0),
+                    }
+                )
+        return gpd.GeoDataFrame(records, crs=crs) if records else gpd.GeoDataFrame()
+
