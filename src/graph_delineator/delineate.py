@@ -13,6 +13,7 @@ import pandas as pd
 import pyproj
 from pathlib import Path
 from tqdm import tqdm
+from shapely import set_precision
 from shapely.geometry import Point, LineString, Polygon
 from shapely.ops import transform, unary_union
 from typing import Dict, List, Tuple, Any
@@ -372,38 +373,32 @@ def consolidate_graph(
         if "polygon" in data:
             data["component_polygons"] = [data["polygon"]]
 
-    # 1. Initial calculation of stream orders (required for the logic, though simplified here)
     calculate_stream_orders(G)
 
     merge_history = []
 
-    # 2. Iterative Consolidation Loop (Mimicking the 'while True' loop)
+    # Iterative consolidation loop
     for i in range(max_iterations):
         initial_nodes = G.number_of_nodes()
         merges_in_round = 0
 
-        # --- Sequence of Merge Rules ---
-
-        # 2a. Merge small leaves downstream (Mimics trim_clusters/prune_leaves)
+        # Merge small leaves downstream
         merges_in_round += merge_leaves(G, target_area, preserve_gauges, merge_history)
 
-        # 2b. Merge stems downstream
+        # Merge stems downstream
         merges_in_round += collapse_stems(
             G, target_area, preserve_gauges, merge_history
         )
 
-        # 2c. Re-calculate orders after structural changes (Crucial, as in the first code)
-        # calculate_stream_orders(G)
-
-        # 3. Check for Convergence
+        # Check for Convergence
         final_nodes = G.number_of_nodes()
         if final_nodes == initial_nodes:
             break
 
-    # 4. Final step: Merge stems upstream (Mimics last_merge)
+    # Final step: Merge stems upstream 
     merge_stems_upstream(G, target_area, preserve_gauges, merge_history)
 
-    # 5. Final recomputation of attributes
+    # Final recomputation of attributes
     finalize_geometry(G)
     calculate_stream_orders(G)
     calculate_upstream_areas(G)
@@ -417,68 +412,53 @@ def can_be_source(G: nx.DiGraph, n: Any, preserve_gauges: bool) -> bool:
         return False
     return True
 
-
 def merge_nodes(G: nx.DiGraph, source: str, target: str, reason: str) -> dict:
-    """Merge `source` node INTO `target` node (source is removed)."""
+    """Merge `source` node INTO `target` node with immediate geometry optimization."""
     if source not in G or target not in G:
         return None
 
     s = G.nodes[source]
     t = G.nodes[target]
 
-    # Instead of unioning now, just extend the list of components
-    if "component_polygons" in s:
-        t.setdefault("component_polygons", []).extend(s["component_polygons"])
-    # Fallback if source didn't have the list initialized yet
-    elif "polygon" in s:
-        t.setdefault("component_polygons", []).append(s["polygon"])
+    # Union the catchment geometries
+    if "polygon" in s and "polygon" in t:
+        combined = unary_union([s["polygon"], t["polygon"]])
+        combined = set_precision(combined, grid_size=1e-6)
+        t["polygon"] = combined.simplify(1e-7)
 
-    # --- Merge area + length ---
+    # Sum up the area attributes
     t["area_km2"] = t.get("area_km2", 0) + s.get("area_km2", 0)
-    t["length_km"] = max(t.get("length_km", 0), s.get("length_km", 0))
 
-    # --- Update node type ---
-    if t.get("node_type") == "original":
-        t["node_type"] = "merged"
+    # Union the river geometries
+    if s.get("river_geom") and t.get("river_geom"):
+        t["river_geom"] = unary_union([s["river_geom"], t["river_geom"]])
 
-    # --- Rewire incoming edges ---
+    # --- Rewire edges ---
     for pred in list(G.predecessors(source)):
-        if pred != target:
-            G.add_edge(pred, target)
-
-    # --- Rewire outgoing edges ---
+        if pred != target: G.add_edge(pred, target)
     for succ in list(G.successors(source)):
-        if succ != target:
-            G.add_edge(target, succ)
+        if succ != target: G.add_edge(target, succ)
 
-    # --- Remove old node ---
     G.remove_node(source)
 
-    return {
-        "source": source,
-        "target": target,
-        "merged_area": s.get("area_km2", 0),
-        "reason": reason,
-    }
+    return {"source": source, "target": target, "reason": reason}
 
 
 def finalize_geometry(G: nx.DiGraph):
-    """Performs the expensive unary_union only once per node at the end."""
+    """Final cleanup of geometries using Mitre joins to prevent vertex explosion."""
     for n in G.nodes:
-        comps = G.nodes[n].get("component_polygons", [])
-        # If we have accumulated components, union them now
-        if len(comps) > 1:
-            # Add the current node's main polygon if not already in list
-            if "polygon" in G.nodes[n] and G.nodes[n]["polygon"] not in comps:
-                comps.append(G.nodes[n]["polygon"])
+        if "polygon" in G.nodes[n]:
+            poly = G.nodes[n]["polygon"]
             
-            merged_poly = unary_union(comps)
-            merged_poly = merged_poly.buffer(MERIT_RES).buffer(-MERIT_RES)
-            G.nodes[n]["polygon"] = merged_poly
+            # Use Mitre joins (style 2) to avoid creating arcs at every corner
+            refined = poly.buffer(MERIT_RES, join_style=2).buffer(-MERIT_RES, join_style=2)
             
-        # Clean up temp attribute to save memory
-        if "component_polygons" in G.nodes[n]:
-            del G.nodes[n]["component_polygons"]
+            # Snap to grid and simplify one last time
+            refined = set_precision(refined, grid_size=1e-6)
+            G.nodes[n]["polygon"] = refined.simplify(1e-7)
+
+            if "river_geom" in G.nodes[n]:
+                G.nodes[n]["river_geom"] = set_precision(G.nodes[n]["river_geom"], 1e-6)
 
 
 def merge_leaves(
