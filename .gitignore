@@ -1,6 +1,5 @@
 /data
 
-*.ipynb
 
 # Python-generated files
 __pycache__/
